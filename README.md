@@ -8,3 +8,7 @@ written in [Tcl/TK](https://www.tcl.tk/)
 - Tested on Mac/Linux/Android with tcl/tk8.6
 - Single file version (constituent parts to come)
 - This is my "backup" copy, in case I loose my local copy
+
+## Sample screenshot
+
+![sample screen shot](screenshot.png)
