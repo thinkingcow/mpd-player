@@ -2,9 +2,10 @@
 # the next line restarts using wish \
 exec wish "$0" ${1+"$@"}
 
-# Music player control (C) S Uhler, 2021
+# Music player control (C) S Uhler, 2021, 2022
 # Intended for use with wish8.6
 # This is the "all in one file" standaline version
+# - change the host in m_open to point to your mpd daemon
 # - runs as an android app using "androwish"
 # - Communucates using the mpd socket protocol
 # - use the scroll wheel to resize text
@@ -12,20 +13,27 @@ exec wish "$0" ${1+"$@"}
 
 # Theory of operation
 # - keeps one socket to mpd open
-# - stays in the "noidle" mpd state, to receive async events from mpd
+# - stays in the "idle" mpd state, to receive async events from mpd
 # - commands are placed on a Queue, which are send to mpd by setting
 #   mpd into "noidle" mode, sending the Q'd commands, then returning to idle mode
+
+proc debug {msg} {
+  set l [info level]
+  incr l -1
+  set n [lindex [info level $l] 0]
+  puts stderr "$n: $msg"
+}
 
 # mpd socket interface
 # see: https://mpd.readthedocs.io/en/latest/protocol.html
 
 proc m_open {callback {host 192.168.1.56} {port 6600}} {
   if {[catch "socket $host $port" sock]} {
-    puts stderr "Cant open socket: $sock"
+    debug "Cant open socket: $sock"
     return -code error
   }
   fconfigure $sock -blocking 1 -buffering line
-  enq status listplaylists
+  enq status listplaylists outputs clearerror
   fileevent $sock readable [list $callback $sock]
   return $sock
 }
@@ -40,13 +48,14 @@ proc m_command {sock args} {
 set S(command) start
 proc cmd {sock cmd} {
   global S
-  puts stderr "$sock cmd:($cmd)"
+  debug $cmd
   set S(command) [lindex $cmd 0]
   if {[catch {
     puts $sock $cmd
   }]} {
-    set S(command) error
     global ErrorInfo
+    debug "Error running ($cmd): $ErrorInfo"
+    set S(command) error
     set_status "Socket died sending command, restarting..."
     after 1000 start_service
   }
@@ -63,14 +72,18 @@ proc m_response {sock} {
     return
   }
   if {[regexp {^(OK|ACK)} $line all code]} {
-    puts stderr "cmd $S(command) complete: $code"
+    debug "$S(command) complete: $code"
     if {$S(command) == "listplaylists"} {
       update_channels
     }
+    if {$S(command) == "outputs" && [llength [grid slaves .outputs]] == 0} {
+      debug "creating output buttons"
+      create_outputs
+    }
     if {![deq $sock]} {
-       cmd $sock idle
+       cmd $sock "idle"
        if {[info exists S(error)]} {
-         set_status $S(error)
+         set_status "Server error: $S(error)"
          unset S(error)
        }
     }
@@ -85,6 +98,7 @@ proc m_response {sock} {
 proc process_key {sock n v} {
   global S
   set S($n) $v
+  # debug "key: ($n) = ($v)"
   switch -exact $n {
     playlist {
       # playlist meaning changes based on command
@@ -98,12 +112,32 @@ proc process_key {sock n v} {
       enq "playlistinfo $v"
     }
     changed {
+      debug "changed event ($v)"
       if {[regexp {^mixer|player$} $v]} {
         enq status 
         catch {clear_fields .}
       } elseif {$v == "stored_playlist"} {
         enq listplaylists
+        set_status "updating playlists"
+      } elseif {$v == "output"} {
+        set_status "Output changed"
+        enq outputs
+      } else {
+        set_status "unknown change: $v"
       }
+     
+    }
+    outputid {
+      global O_id 
+      set O_id $v
+    }
+    outputname {
+      global Outputs O_id 
+      set Outputs($O_id) $v
+    }
+    outputenabled {
+      global Enabled O_id 
+      set Enabled($O_id) $v
     }
   }
 }
@@ -161,7 +195,7 @@ proc ui {} {
  
   grid [label .title -textvariable State -anchor c -font title] -sticky ew
   # use "text" as geometry manager to facilitate reflowing buttons
-  grid [text .t -height 2 -width 30 -bg #d9d9d9 -state disabled] -sticky nsew
+  grid [text .t -height 2 -width 30 -bg white -state disabled] -sticky nsew
   grid [labelframe .data_frame -text "Current" -labelanchor n -font label] -sticky nsew
   grid [label .status -foreground red -textvariable Status -anchor c -font value] -sticky ew
 
@@ -173,6 +207,8 @@ proc ui {} {
   .t window create end -window [button .next      -text \u23ed -command {do next}]
   .t window create end -window [button .shuffle   -text 🔀 -command toggle_random]
   .t window create end -window [menubutton .mb -text "playlist" -menu .mb.playlists]
+  .t window create end -window \
+	[labelframe .outputs -text "outputs" -labelanchor n -font label]
   .t window create end -window [button .exit -text 🛑 -command do_exit]
   .t insert end " "
   menu .mb.playlists -tearoff true -title "Playlists"
@@ -180,6 +216,7 @@ proc ui {} {
   foreach i [.t window names] {
     $i configure -font button
   }
+  .mb configure -font label
 
   foreach i {Name Title Artist Album} {
     grid [label .l_$i -text $i -font label] \
@@ -222,7 +259,11 @@ proc update_state {a v w} {
 proc set_state {} {
   global S State
     if {![info exists S(song)]} {set S(song) 0}
-    set vol [format "%3d%%" $S(volume)]
+    if {![info exists S(volume)]} {
+      set vol n/a
+    } else {
+      set vol [format "%3d%%" $S(volume)]
+    }
     array set map {pause paused play playing stop stopping}
     set State \
       "Track [incr S(song)]/$S(playlistlength) volume $vol \[$map($S(state))\]"
@@ -238,7 +279,6 @@ proc set_status {args} {
   global Status Status_count
   incr Status_count
   set Status {*}$args
-  puts stderr "Status: $args"
   after [status_delay] "reset_status $Status_count"
 }
 
@@ -266,6 +306,21 @@ proc update_channels {} {
    .mb.playlists add command -label $i -command "do_playlist \$Socket $i"
   }
   unset Channels
+}
+
+# Create a control for each available output
+# - Assume outputs don't change after initialization
+# - No controls created if only one output is available
+proc create_outputs {} {
+    global Outputs Enabled
+    if {[array size Outputs] < 2} return
+    set col 0
+    foreach {i name} [array get Outputs] {
+      set c [checkbutton .o_$i -text $name -variable Enabled($i) \
+             -command "do toggleoutput $i" -font label]
+      grid $c -in .outputs -row 0 -column $col
+      incr col
+    }
 }
 
 proc clear_fields {{root .} {dflt -}} {
@@ -328,6 +383,7 @@ proc help {} {
     .mb "Select a playlist"
     .exit "Exit"
     .title "Status of currenly playing track"
+    .outputs "Select audio output channels"
   }
   foreach {n v} [array get help] {
     bind $n <Enter> [list set Status $v]
@@ -339,7 +395,7 @@ proc read_config {name} {
   global Config
   if {![catch [list open $name] f]} {
     array set Config [read $f]
-    puts stderr "config: [array get Config]"
+    debug "config: [array get Config]"
     close $f
   }
 }
@@ -347,7 +403,7 @@ proc read_config {name} {
 proc write_config {name} {
   global Config
   if {![catch [list open $name w] f]} {
-    set Config(version) 0.1
+    set Config(version) 0.2
     set Config(saved) [clock format [clock seconds] -format "%D-%T"]
     puts -nonewline $f [array get Config]
     close $f
@@ -381,7 +437,7 @@ proc adjust_font {name i} {
 }
 
 proc do_exit {} {
-  puts stderr "Exiting!"
+  debug "Exiting!"
   write_config "~/.mui_tclrc"
   exit
 }
